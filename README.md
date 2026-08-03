@@ -129,3 +129,7 @@ The experiment plan's phases 0–8 are complete and documented. Not done:
 plots of the sweep data, a CUTLASS profiler cross-check, and the Phase 5
 register/accumulator sweep as a standalone experiment (it is currently only
 observed indirectly, via cuBLAS's 234 reg/thread at half our occupancy).
+
+## License
+
+[MIT](LICENSE).
