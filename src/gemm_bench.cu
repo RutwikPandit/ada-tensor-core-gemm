@@ -46,6 +46,16 @@
 #define ACC_F16 0
 #endif
 
+// MMA_K8=1 issues two mma.m16n8k8 per k16 step instead of one mma.m16n8k16.
+// Same FLOPs, same operand registers, 2x the instruction count at half the
+// per-instruction pipe occupancy -- which is the shape cuBLAS uses.
+#ifndef MMA_K8
+#define MMA_K8 0
+#endif
+#if MMA_K8 && ACC_F16
+#error "MMA_K8 is implemented for FP32 accumulation only"
+#endif
+
 #define CUDA_CHECK(x)                                                              \
     do {                                                                           \
         cudaError_t e_ = (x);                                                       \
@@ -106,6 +116,20 @@ __device__ __forceinline__ void mma_m16n8k16(float (&c)[4], const uint32_t (&a)[
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
                    "r"(b[0]), "r"(b[1]));
+}
+
+// m16n8k8: half the K of the shape above, so it occupies its sub-partition for
+// 16 cycles rather than 32. This is what cuBLAS's `s1688` kernel issues. Two of
+// these are exactly equivalent to one m16n8k16 -- the operand registers we
+// already hold from ldmatrix split cleanly into a k=0..7 pair and a k=8..15 pair,
+// so this costs nothing to try and isolates "does finer granularity feed the
+// pipe better" from every other difference.
+__device__ __forceinline__ void mma_m16n8k8(float (&c)[4], const uint32_t (&a)[2],
+                                            uint32_t b) {
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(b));
 }
 
 // FP16-accumulate form: 2 result registers instead of 4 (each holds a packed
@@ -287,8 +311,16 @@ void gemm_kernel(const half* __restrict__ A, const half* __restrict__ B,
                     // group g covers n-tiles 2g (lanes 0-7 rows) and 2g+1;
                     // d[h] is the k-low half, d[2+h] the k-high half.
                     const int g = ni >> 1, h = ni & 1;
+#if MMA_K8
+                    // same registers, split into the two k halves
+                    const uint32_t alo[2] = {ra[mi][0], ra[mi][1]};
+                    const uint32_t ahi[2] = {ra[mi][2], ra[mi][3]};
+                    mma_m16n8k8(acc[mi][ni], alo, rb[g][h]);
+                    mma_m16n8k8(acc[mi][ni], ahi, rb[g][2 + h]);
+#else
                     uint32_t b2[2] = {rb[g][h], rb[g][2 + h]};
                     mma_m16n8k16(acc[mi][ni], ra[mi], b2);
+#endif
                 }
             }
         }
@@ -380,9 +412,17 @@ __global__ void bias_relu_kernel(half* D, const half* bias, int M, int N, float 
 // ---------------------------------------------------------------------------
 template <int TILE> struct TileCfg;
 // BM,  BN,  BK, WARPS_M, WARPS_N   -> threads, warp tile, acc regs
-template <> struct TileCfg<0> { enum { BM =  64, BN = 128, BK = 32, WM = 2, WN = 4 }; }; // 256 thr, 32x32, 32
-template <> struct TileCfg<1> { enum { BM = 128, BN = 128, BK = 32, WM = 2, WN = 4 }; }; // 256 thr, 64x32, 64
-template <> struct TileCfg<2> { enum { BM = 128, BN = 256, BK = 32, WM = 2, WN = 8 }; }; // 512 thr, 64x32, 64
+template <> struct TileCfg<0> { enum { BM =  64, BN = 128, BK = 32, WM = 2, WN = 4 }; }; // 256 thr, 32x32,  32
+template <> struct TileCfg<1> { enum { BM = 128, BN = 128, BK = 32, WM = 2, WN = 4 }; }; // 256 thr, 64x32,  64
+template <> struct TileCfg<2> { enum { BM = 128, BN = 256, BK = 32, WM = 2, WN = 8 }; }; // 512 thr, 64x32,  64
+// Tile 3 copies cuBLAS's strategy: only 4 warps per CTA, each owning a 64x64
+// quarter of the output. That doubles accumulators to 128 registers/thread and
+// cuts resident warps in half, buying mma latency hiding with instruction-level
+// parallelism instead of occupancy -- and it halves barrier cost, since a
+// __syncthreads() per k-tile now waits on 4 warps rather than 8.
+template <> struct TileCfg<3> { enum { BM = 128, BN = 128, BK = 32, WM = 2, WN = 2 }; }; // 128 thr, 64x64, 128
+// Tile 4 pushes the same idea further on the M side.
+template <> struct TileCfg<4> { enum { BM = 256, BN = 128, BK = 32, WM = 2, WN = 2 }; }; // 128 thr, 128x64, 256
 
 struct Result {
     bool  ok = false;
@@ -558,6 +598,8 @@ static RunFn pick(int tile, int layout, int stages) {
         case 0: return pick_layout<0>(layout, stages);
         case 1: return pick_layout<1>(layout, stages);
         case 2: return pick_layout<2>(layout, stages);
+        case 3: return pick_layout<3>(layout, stages);
+        case 4: return pick_layout<4>(layout, stages);
     }
     return nullptr;
 }
@@ -569,7 +611,10 @@ static void tile_dims(int t, int& bm, int& bn, int& bk) {
     switch (t) {
         case 0: bm = 64;  bn = 128; bk = 32; break;
         case 1: bm = 128; bn = 128; bk = 32; break;
-        default: bm = 128; bn = 256; bk = 32; break;
+        case 2: bm = 128; bn = 256; bk = 32; break;
+        case 3: bm = 128; bn = 128; bk = 32; break;
+        case 4: bm = 256; bn = 128; bk = 32; break;
+        default: bm = bn = bk = 0; break;
     }
 }
 
@@ -681,7 +726,11 @@ int main(int argc, char** argv) {
                    "             for skinny M where cuBLAS switches to split-K)\n"
                    "  --cpu S    verify S output elements against a double-precision CPU dot\n"
                    "             product; deterministic ground truth, cost O(S*K)\n"
-                   "  tile 0 = 64x128x32 (256thr)  1 = 128x128x32 (256thr)  2 = 128x256x32 (512thr)\n"
+                   "  tile 0 = 64x128x32  256thr  warp 32x32    32 acc regs\n"
+                   "       1 = 128x128x32 256thr  warp 64x32    64 acc regs  (default)\n"
+                   "       2 = 128x256x32 512thr  warp 64x32    64 acc regs\n"
+                   "       3 = 128x128x32 128thr  warp 64x64   128 acc regs  (cuBLAS-style ILP)\n"
+                   "       4 = 256x128x32 128thr  warp 128x64  256 acc regs\n"
                    "  --group G  L2 CTA rasterization: G M-tiles walked column-major (1 = row-major)\n"
                    "  --sweep    stages 1..6 at fixed tile/layout/group\n"
                    "  --gsweep   group 1,2,4,8,16 at fixed tile/layout/stages\n",

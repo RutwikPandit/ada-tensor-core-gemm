@@ -179,16 +179,21 @@ twice instead of staying in an FP32 register.
 
 | M=N=K | 4096 | 8192 |
 |---|---:|---:|
-| this kernel | **29.50 TFLOP/s** | **29.26 TFLOP/s** |
-| cuBLAS | 31.22 | 31.04 |
-| **% of cuBLAS** | **94.5%** | **94.2%** |
-| dense Tensor Core occupancy | **91.9–92.4%** | — |
-| registers / thread | 116 | 116 |
+| **best kernel** | **29.62 TFLOP/s** | **29.95 TFLOP/s** |
+| cuBLAS | 31.06 | 31.03 |
+| **% of cuBLAS** | **95.3%** | **96.5%** |
+| dense Tensor Core occupancy | **92.7%** | — |
+| registers / thread | 220 | 220 |
 | register spills | **0** | **0** |
 
-Final geometry: `128×128×32` CTA tile, 8 warps, warp tile 64×32,
-`mma.sync.m16n8k16.row.col.f32.f16.f16.f32`, 2 `cp.async` stages, XOR-swizzled
-shared memory, grouped CTA rasterization.
+Best geometry: `128×128×32` CTA tile, **4 warps**, warp tile 64×64,
+two `mma.sync.m16n8k8` per k-step, 3 `cp.async` stages, XOR-swizzled shared
+memory, grouped CTA rasterization.
+
+The wide-occupancy variant that most of the analysis below was done on — 8 warps,
+warp tile 64×32, one `m16n8k16`, 2 stages, 116 registers — reaches 94.5% / 94.2%.
+Both are in the repo (`--tile 1` vs `--tile 3`); see
+[Closing the gap](#closing-the-gap-with-cublas).
 
 **Sustained**, over 240 s and 50,272 launches: 28.81 TFLOP/s at 113.8 W and
 2634 MHz, 72 °C, with **no throttle reason ever asserted** and only 2.5% decay.
@@ -200,11 +205,53 @@ CPU oracle exists because cuBLAS turned out to be a *non-deterministic* referenc
 for skinny matrices, where it switches to split-K and its rounding drifts between
 runs.
 
-Where the remaining ~7.6% goes: ~2.3% is unavoidable wave quantization (1024 CTAs
-over 48 resident slots), sub-1% is prologue/epilogue, and ~4% is per-k-tile
-barrier and `ldmatrix` cost not fully hidden. cuBLAS closes most of that with a
-much larger register tile — 234 registers/thread at *half* our occupancy, buying
-latency hiding with ILP instead of resident warps. That is the next thing to try.
+Where the remaining gap goes: ~2.3% is unavoidable wave quantization (1024 CTAs
+over 48 resident slots — cuBLAS pays this too, and it is essentially cuBLAS's
+*entire* shortfall from the hardware roof), sub-1% is prologue/epilogue, and the
+rest is per-k-tile barrier and `ldmatrix` cost not fully hidden.
+
+## Closing the gap with cuBLAS
+
+Diagnosing that gap turned out to be straightforward, because both kernels do
+*identical* Tensor Core work — same FLOPs at the same rate means both must spend
+11,184,811 busy tensor cycles per sub-partition. Only the elapsed time around it
+differs. So the question was never "why are our Tensor Cores slower", but "what
+are we doing in the extra cycles".
+
+cuBLAS answered it by inspection: it runs **128 threads and 234 registers per
+thread** — half our occupancy, twice our register tile — and issues `m16n8k8`
+rather than `m16n8k16`. It buys latency hiding with instruction-level parallelism
+instead of resident warps, and with 4 warps per CTA instead of 8, each
+`__syncthreads()` is half as expensive.
+
+Copying both choices (`--tile 3`, and the `MMA_K8=1` build) works:
+
+| | threads | reg/thread | warps_active | barrier stall | tensor occupancy | 4096³ |
+|---|---:|---:|---:|---:|---:|---:|
+| 8 warps, `m16n8k16` | 256 | 116 | 32.9% | 2.78 | 91.9% | 94.5% |
+| **4 warps, 2×`m16n8k8`** | **128** | **220** | **16.5%** | **1.96** | **92.7%** | **95.3%** |
+| cuBLAS | 128 | 234 | 16.5% | 1.17 | 97.9% | 100% |
+
+Occupancy now matches cuBLAS to 0.04 pp and the instruction count matches exactly
+(67.1 M). The gain is larger at 8192³ (94.2% → 96.5%) than at 4096³, and it needs
+**3** stages rather than 2 — with only 8 warps per SM there is less to hide memory
+latency with, so the pipeline has to be deeper.
+
+Two things this experiment taught that the table doesn't show:
+
+- **The register cliff is sharp.** `m16n8k8` on the *8-warp* tile pushes registers
+  116 → 132, and 65,536 / (256 × 2) = 128 is the ceiling for two CTAs/SM — so it
+  drops to one CTA and collapses to 78%. The same change on the 4-warp tile is
+  free, because halving the threads doubles the per-thread register budget. The
+  two changes only work *together*.
+- **Going further fails.** A 256×128 tile with 128 threads needs 256 accumulator
+  registers, hits the 255 hard limit, spills 668 B and lands at 66%. `--tile 4` is
+  kept in the repo as the negative result.
+
+The remaining ~5% to cuBLAS is now mostly shared-memory delivery: it has **26,472**
+bank conflicts against our 33.6 M. Our XOR swizzle is only 2-way at `BK=32`
+because a 64 B row holds just four 16 B chunks; `BK=64` would make it
+conflict-free. That is the next experiment.
 
 ---
 
@@ -261,8 +308,9 @@ survive:
   this was built on 12.3. The probe is version-guarded so it activates on upgrade.
   Note FP8 with *FP32* accumulate is halved exactly like FP16 — 1024 FLOP/clk/SM,
   not 2048. INT8 `m16n8k32` works today and measures 2048.4 ops/clk/SM.
-- **Not done:** plots of the sweep data, a CUTLASS cross-check, and a standalone
-  register/accumulator-pressure sweep.
+- **Not done:** plots of the sweep data, a CUTLASS cross-check, and a `BK=64`
+  layout to make the XOR swizzle conflict-free — currently the largest single
+  remaining difference from cuBLAS.
 
 ---
 
@@ -295,7 +343,7 @@ Windows/PowerShell. Newer MSVC than CUDA officially supports is handled in
 
 | Flag | Meaning |
 |---|---|
-| `--tile 0\|1\|2` | 64×128×32 / **128×128×32** / 128×256×32 |
+| `--tile 0..4` | see `--help`; **3** = 4-warp ILP tile (best), 1 = 8-warp, 4 = spills on purpose |
 | `--stages 1..6` | pipeline depth; 1 = synchronous baseline |
 | `--layout 0\|1\|2` | row-major / padded / **XOR swizzle** |
 | `--group G` | L2 CTA rasterization; 1 = plain row-major order |

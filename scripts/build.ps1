@@ -56,6 +56,11 @@ try {
     Invoke-Nvcc ($flags + @('-DACC_F16=1', $gb,
                             '-o', 'gemm_bench_f16acc.exe', '-lcublas')) 'gemm_bench_f16acc.exe (FP16 accumulate)'
 
+    # Two mma.m16n8k8 per k16 step instead of one m16n8k16 -- the shape cuBLAS
+    # issues. Same FLOPs, 2x instructions at half the pipe occupancy each.
+    Invoke-Nvcc ($flags + @('-DMMA_K8=1', $gb,
+                            '-o', 'gemm_bench_k8.exe', '-lcublas')) 'gemm_bench_k8.exe (mma m16n8k8)'
+
     foreach ($ext in '*.exp', '*.lib', '*.obj') {
         Get-ChildItem $ext -ErrorAction SilentlyContinue | Remove-Item -Force
     }
