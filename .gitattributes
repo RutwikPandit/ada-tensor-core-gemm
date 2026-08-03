@@ -1,0 +1,12 @@
+* text=auto eol=lf
+
+# PowerShell 5.1 is happiest with CRLF; keep these native on checkout
+*.ps1 text eol=crlf
+
+*.cu  text eol=lf
+*.cuh text eol=lf
+*.md  text eol=lf
+*.csv text eol=lf
+
+*.ncu-rep binary
+*.exe     binary

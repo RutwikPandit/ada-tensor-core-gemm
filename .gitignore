@@ -1,0 +1,21 @@
+# build output
+bin/
+*.exe
+*.exp
+*.lib
+*.obj
+*.pdb
+*.ptx
+*.cubin
+
+# Nsight Compute reports: ~3 MB each and fully regenerable with
+# scripts/profile.ps1. Drop these two lines if you want them versioned.
+reports/*.ncu-rep
+reports/*.ncu-rep.lock
+
+# editors / OS
+.vs/
+.vscode/
+*.user
+Thumbs.db
+desktop.ini
